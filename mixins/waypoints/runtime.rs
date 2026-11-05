@@ -1,6 +1,7 @@
 // Waypoints for Horizon: N makes a waypoint where you stand, M lists them.
 // Each waypoint has a name, a colour and a dimension, can be hidden, edited
 // or deleted, and shows its name and distance in the world while visible.
+// Dying leaves a waypoint where it happened, unless that is turned off.
 // Waypoints are kept per world (single player) and per server address.
 // This file is both the mod's Cargo library (its tests) and the module the
 // bundle adds to the game; it uses only std, and the hooks hand it plain data.
@@ -10,8 +11,8 @@ use std::path::PathBuf;
 /// The mod's id (its data folder and its keys' lines), name and version.
 pub const ID: &str = "waypoints";
 pub const NAME: &str = "Waypoints";
-pub const VERSION: &str = "1.0.0";
-pub const DESCRIPTION: &str = "N creates a waypoint, M lists them: hide, edit, recolour or delete them. Visible waypoints show their name and distance in the world.";
+pub const VERSION: &str = "1.1.0";
+pub const DESCRIPTION: &str = "N creates a waypoint, M lists them: hide, edit, recolour or delete them. Visible waypoints show their name and distance in the world, and dying can leave one where you died.";
 /// The keys' names and defaults (`key.waypoints.create` in `horizon-mods.txt`).
 pub const KEY_CREATE: &str = "create";
 pub const KEY_LIST: &str = "list";
@@ -27,6 +28,10 @@ pub const PALETTE: [u32; 16] = [
     0xFF5555, 0xFFAA00, 0xFFFF55, 0x55FF55, 0x00AA00, 0x55FFFF, 0x00AAAA, 0x5555FF, 0x0000AA,
     0xAA00AA, 0xFF55FF, 0xFFFFFF, 0xAAAAAA, 0x555555, 0xAA5500, 0x000000,
 ];
+
+/// A death waypoint's colour, and how many the mod keeps: the oldest goes.
+const DEATH_COLOR: u32 = 0xFF5555;
+const DEATH_MAX: usize = 5;
 
 const NAME_MAX: usize = 32;
 const COORD_MAX: usize = 9;
@@ -56,7 +61,12 @@ pub struct Waypoint {
     pub dimension: String,
     pub color: u32,
     pub hidden: bool,
+    /// Made by a death: the oldest of these go, unless renamed.
+    pub death: bool,
 }
+
+/// A dimension and a block, as the game keeps the last death.
+pub type Spot = (String, [i32; 3]);
 
 /// Where the player is, as the hooks read it.
 #[derive(Clone, Debug, PartialEq)]
@@ -193,6 +203,18 @@ pub struct Widget {
     pub action: Action,
 }
 
+/// What `State::track_death` remembers of the world being played.
+#[derive(Debug, Default)]
+pub struct DeathTracker {
+    /// The game's last death, from the world's first frame on.
+    known: Option<Option<Spot>>,
+    /// The death screen was up last frame.
+    dead: bool,
+    /// The newest death waypoint came from the death screen, and the server
+    /// says where the death was with the respawn.
+    awaiting: bool,
+}
+
 /// Everything the mod keeps, on the window's thread.
 #[derive(Debug)]
 pub struct State {
@@ -211,6 +233,9 @@ pub struct State {
     pub close_requested: bool,
     /// Labels in the world on or off (Options > Mods), read once.
     pub labels: Option<bool>,
+    /// Death waypoints on or off (Options > Mods), read once.
+    pub deaths: Option<bool>,
+    pub tracker: DeathTracker,
 }
 
 impl Default for State {
@@ -226,6 +251,8 @@ impl Default for State {
             skip_char: None,
             close_requested: false,
             labels: None,
+            deaths: None,
+            tracker: DeathTracker::default(),
         }
     }
 }
@@ -274,25 +301,27 @@ fn unescape(s: &str) -> String {
     out
 }
 
-/// One line per waypoint: name, x, y, z, dimension, colour, hidden.
+/// One line per waypoint: name, x, y, z, dimension, colour, hidden, death.
 pub fn encode(list: &[Waypoint]) -> String {
     let mut out = String::from("# waypoints 1\n");
     for w in list {
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{:06X}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{:06X}\t{}\t{}\n",
             escape(&w.name),
             w.pos[0],
             w.pos[1],
             w.pos[2],
             w.dimension,
             w.color & 0xFF_FFFF,
-            u8::from(w.hidden)
+            u8::from(w.hidden),
+            u8::from(w.death)
         ));
     }
     out
 }
 
-/// What `encode` wrote; broken lines are skipped.
+/// What `encode` wrote; broken lines are skipped. Files of 1.0 have no death
+/// column.
 pub fn decode(text: &str) -> Vec<Waypoint> {
     text.lines()
         .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
@@ -307,6 +336,7 @@ pub fn decode(text: &str) -> Vec<Waypoint> {
                 dimension: f[4].to_owned(),
                 color: u32::from_str_radix(f[5], 16).ok()? & 0xFF_FFFF,
                 hidden: f[6].trim() == "1",
+                death: f.get(7).is_some_and(|v| v.trim() == "1"),
             })
         })
         .collect()
@@ -528,6 +558,7 @@ impl State {
         self.world = key;
         self.dir = Some(dir);
         self.scroll = 0;
+        self.tracker = DeathTracker::default();
         self.reset();
     }
 
@@ -546,6 +577,77 @@ impl State {
             n += 1;
         }
         format!("Waypoint {n}")
+    }
+
+    /// The next `Death n`, counting on from the newest kept.
+    fn death_name(&self) -> String {
+        let last = self
+            .waypoints
+            .iter()
+            .filter(|w| w.death)
+            .filter_map(|w| w.name.strip_prefix("Death ")?.parse::<u32>().ok())
+            .max();
+        format!("Death {}", last.unwrap_or(0) + 1)
+    }
+
+    /// A waypoint at `spot`, unless one of the deaths is already there; the
+    /// oldest go past `DEATH_MAX`. Says whether it made one.
+    fn add_death(&mut self, on: bool, (dimension, pos): Spot) -> bool {
+        let same = |w: &Waypoint| w.death && w.pos == pos && w.dimension == dimension;
+        if !on || self.waypoints.iter().any(same) {
+            return false;
+        }
+        self.waypoints.push(Waypoint {
+            name: self.death_name(),
+            pos,
+            dimension,
+            color: DEATH_COLOR,
+            hidden: false,
+            death: true,
+        });
+        let deaths = self.waypoints.iter().filter(|w| w.death).count();
+        let mut extra = deaths.saturating_sub(DEATH_MAX);
+        self.waypoints.retain(|w| {
+            let gone = w.death && extra > 0;
+            extra -= usize::from(gone);
+            !gone
+        });
+        // The rows moved: a form or a Delete open on one would hit another.
+        self.confirm_delete = None;
+        if matches!(self.mode, Mode::Edit(_)) {
+            self.close();
+        }
+        self.persist();
+        true
+    }
+
+    /// Once a frame: a waypoint where the player died, when `on`. The game's
+    /// last death (`known`) changes with the death in single player and with
+    /// the respawn on a server, which may come with no death screen. On a
+    /// server the death screen (`dead`) comes first, so the waypoint starts
+    /// where the player lies (`here`) and moves to the server's block.
+    pub fn track_death(&mut self, on: bool, dead: bool, known: Option<&Spot>, here: Option<&Here>) {
+        if self.world.is_none() {
+            return;
+        }
+        let changed = self.tracker.known.as_ref().is_some_and(|k| k.as_ref() != known);
+        self.tracker.known = Some(known.cloned());
+        let fell = dead && !self.tracker.dead;
+        self.tracker.dead = dead;
+        if let Some(spot) = known.filter(|_| changed) {
+            if std::mem::take(&mut self.tracker.awaiting) {
+                if let Some(w) = self.waypoints.iter_mut().rev().find(|w| w.death) {
+                    (w.dimension, w.pos) = spot.clone();
+                    self.persist();
+                }
+            } else {
+                self.add_death(on, spot.clone());
+            }
+        } else if let (true, Some(here)) = (fell, here) {
+            let spot = (here.dimension.clone(), here.pos.map(|v| v.floor() as i32));
+            let told = known == Some(&spot);
+            self.tracker.awaiting = self.add_death(on, spot) && !told;
+        }
     }
 
     /// The create form, filled in with where the player stands.
@@ -633,12 +735,18 @@ impl State {
             return;
         };
         let name = editor.name.trim().to_owned();
+        // Renaming a death waypoint keeps it for good.
+        let death = editor
+            .index
+            .and_then(|i| self.waypoints.get(i))
+            .is_some_and(|w| w.death && w.name == name);
         let waypoint = Waypoint {
             name,
             pos: [x, y, z],
             dimension: editor.dimension.clone(),
             color: editor.color,
             hidden: editor.hidden,
+            death,
         };
         let (index, from_list) = (editor.index, editor.from_list);
         let waypoint = if waypoint.name.is_empty() {
@@ -1067,13 +1175,17 @@ pub fn hit(widgets: &[Widget], at: [f32; 2]) -> Option<Action> {
         .map(|w| w.action.clone())
 }
 
-/// Labels in the world: on unless the setting says `false`.
-pub fn read_labels(stored: Option<String>) -> bool {
+/// A setting that is on unless it says `false`.
+pub fn read_on(stored: Option<String>) -> bool {
     stored.is_none_or(|v| v.trim() != "false")
 }
 
 pub fn labels_label(on: bool) -> String {
     format!("Labels in the world: {}", if on { "ON" } else { "OFF" })
+}
+
+pub fn deaths_label(on: bool) -> String {
+    format!("Waypoint on death: {}", if on { "ON" } else { "OFF" })
 }
 
 #[cfg(test)]
@@ -1100,6 +1212,7 @@ mod tests {
                 dimension: NETHER.into(),
                 color: 0xFF5555,
                 hidden: true,
+                death: false,
             },
             Waypoint {
                 name: "Ünïcode ⛏".into(),
@@ -1107,6 +1220,7 @@ mod tests {
                 dimension: OVERWORLD.into(),
                 color: 0x00AA00,
                 hidden: false,
+                death: false,
             },
         ];
         assert_eq!(decode(&encode(&list)), list);
@@ -1210,6 +1324,7 @@ mod tests {
             dimension: OVERWORLD.into(),
             color: 0xFFAA00,
             hidden: false,
+            death: false,
         });
         s.open_list(None);
         let (draws, widgets) = s.screen([480.0, 270.0], [0.0, 0.0], Some(&here(OVERWORLD)), &measure);
@@ -1239,6 +1354,7 @@ mod tests {
             dimension: dim.into(),
             color: 0x55FFFF,
             hidden,
+            death: false,
         };
         s.waypoints = vec![mk("A", OVERWORLD, false), mk("B", OVERWORLD, true), mk("C", NETHER, false)];
         let draws = s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], &measure);
@@ -1252,5 +1368,130 @@ mod tests {
         assert_eq!(texts, ["A", "20 m"]);
         s.labels = Some(false);
         assert!(s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], &measure).is_empty());
+    }
+
+    fn spot(x: i32) -> Spot {
+        (OVERWORLD.to_owned(), [x, 64, 0])
+    }
+
+    fn played() -> State {
+        let mut s = State::default();
+        s.world = Some("world-test".into());
+        s.track_death(true, false, None, None);
+        s
+    }
+
+    fn names(s: &State) -> Vec<&str> {
+        s.waypoints.iter().map(|w| w.name.as_str()).collect()
+    }
+
+    #[test]
+    fn storage_reads_files_without_the_death_column() {
+        let old = "# waypoints 1\nHome\t1\t2\t3\tminecraft:overworld\tFF5555\t0\n";
+        assert!(!decode(old)[0].death);
+        let mut s = played();
+        s.track_death(true, false, Some(&spot(1)), None);
+        assert!(decode(&encode(&s.waypoints))[0].death);
+    }
+
+    #[test]
+    fn a_death_in_single_player_marks_its_block() {
+        let mut s = played();
+        // The game has the block and shows the death screen in the same frame.
+        s.track_death(true, true, Some(&spot(7)), Some(&here(OVERWORLD)));
+        s.track_death(true, true, Some(&spot(7)), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1"]);
+        assert_eq!(s.waypoints[0].pos, [7, 64, 0]);
+        assert_eq!(s.waypoints[0].color, DEATH_COLOR);
+        // Respawning changes nothing; the next death is a new waypoint.
+        s.track_death(true, false, Some(&spot(7)), Some(&here(OVERWORLD)));
+        s.track_death(true, true, Some(&spot(9)), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1", "Death 2"]);
+    }
+
+    #[test]
+    fn a_death_on_a_server_moves_to_the_servers_block() {
+        let mut s = played();
+        s.track_death(true, true, None, Some(&here(OVERWORLD)));
+        assert_eq!(s.waypoints[0].pos, [10, 64, -4]);
+        // The respawn brings the server's location: the same death.
+        s.track_death(true, false, Some(&spot(11)), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1"]);
+        assert_eq!(s.waypoints[0].pos, [11, 64, 0]);
+    }
+
+    #[test]
+    fn a_death_with_no_death_screen_still_counts() {
+        let mut s = played();
+        s.track_death(true, false, Some(&spot(3)), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1"]);
+    }
+
+    #[test]
+    fn joining_a_world_is_not_a_death() {
+        let mut s = State::default();
+        s.world = Some("world-test".into());
+        s.track_death(true, false, Some(&spot(3)), Some(&here(OVERWORLD)));
+        s.track_death(true, false, Some(&spot(3)), Some(&here(OVERWORLD)));
+        assert!(s.waypoints.is_empty());
+    }
+
+    #[test]
+    fn joining_a_world_while_dead_marks_it_once_and_waits_for_nothing() {
+        let mut s = State::default();
+        s.world = Some("world-test".into());
+        let lying = (OVERWORLD.to_owned(), [10, 64, -4]);
+        s.track_death(true, true, Some(&lying), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1"]);
+        s.track_death(true, false, Some(&lying), Some(&here(OVERWORLD)));
+        s.track_death(true, false, Some(&spot(2)), Some(&here(OVERWORLD)));
+        assert_eq!(names(&s), ["Death 1", "Death 2"]);
+    }
+
+    #[test]
+    fn turned_off_deaths_leave_nothing() {
+        let mut s = played();
+        s.track_death(false, true, None, Some(&here(OVERWORLD)));
+        s.track_death(false, false, Some(&spot(4)), Some(&here(OVERWORLD)));
+        assert!(s.waypoints.is_empty());
+    }
+
+    #[test]
+    fn only_the_newest_deaths_stay_unless_renamed() {
+        let mut s = played();
+        s.waypoints.push(Waypoint {
+            name: "Home".into(),
+            pos: [0, 64, 0],
+            dimension: OVERWORLD.into(),
+            color: 0x55FF55,
+            hidden: false,
+            death: false,
+        });
+        s.track_death(true, false, Some(&spot(1)), None);
+        // Renamed, it is the player's own waypoint.
+        s.act(Action::Edit(1), None);
+        let Mode::Edit(e) = &mut s.mode else { panic!() };
+        e.name = "My stuff".into();
+        s.act(Action::Save, None);
+        assert!(!s.waypoints[1].death);
+
+        for x in 2..=8 {
+            s.track_death(true, false, Some(&spot(x)), None);
+        }
+        assert_eq!(
+            names(&s),
+            ["Home", "My stuff", "Death 3", "Death 4", "Death 5", "Death 6", "Death 7"]
+        );
+        // Saved unchanged, a death waypoint is still one.
+        s.act(Action::Edit(2), None);
+        s.act(Action::Save, None);
+        assert!(s.waypoints[2].death);
+    }
+
+    #[test]
+    fn settings_are_on_unless_turned_off() {
+        assert!(read_on(None));
+        assert!(!read_on(Some("false".into())));
+        assert_eq!(deaths_label(false), "Waypoint on death: OFF");
     }
 }

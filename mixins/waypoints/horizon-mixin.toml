@@ -1,11 +1,12 @@
 [mod]
 id = "waypoints"
-version = "1.0.0"
+version = "1.1.0"
 priority = 100
 
 # Pinned: besides the native hook points it reads the window's world folder
-# and the connected server's address (they name the waypoint file) and the
-# camera the last frame drew from, which are not part of the stable hook points.
+# and the connected server's address (they name the waypoint file), the
+# camera the last frame drew from, and the death screen and last death
+# location, which are not part of the stable hook points.
 [compatibility]
 horizon_revision = "c9d474dd9116e84c243f8992d75c11314df56f06"
 
