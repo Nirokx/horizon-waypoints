@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// The mod's id (its data folder and its keys' lines), name and version.
 pub const ID: &str = "waypoints";
 pub const NAME: &str = "Waypoints";
-pub const VERSION: &str = "1.1.0";
+pub const VERSION: &str = "1.1.1";
 pub const DESCRIPTION: &str = "N creates a waypoint, M lists them: hide, edit, recolour or delete them. Visible waypoints show their name and distance in the world, and dying can leave one where you died.";
 /// The keys' names and defaults (`key.waypoints.create` in `horizon-mods.txt`).
 pub const KEY_CREATE: &str = "create";
@@ -236,6 +236,8 @@ pub struct State {
     /// Death waypoints on or off (Options > Mods), read once.
     pub deaths: Option<bool>,
     pub tracker: DeathTracker,
+    /// The game's view when the last label frame was drawn (`label_camera`).
+    pub seen_view: Option<Camera>,
 }
 
 impl Default for State {
@@ -253,6 +255,7 @@ impl Default for State {
             labels: None,
             deaths: None,
             tracker: DeathTracker::default(),
+            seen_view: None,
         }
     }
 }
@@ -919,15 +922,30 @@ impl State {
         }
     }
 
+    /// The camera to place labels from. The HUD is drawn before the game
+    /// notes the frame's camera, so `drawn` is the last frame's and trails a
+    /// turning view; `view` is this frame's. A mod's camera (freecam, freelook)
+    /// replaces `view`, which shows as a last `view` that isn't what was drawn:
+    /// then only `drawn` is right.
+    pub fn label_camera(&mut self, drawn: Camera, view: Camera) -> Camera {
+        let followed = self
+            .seen_view
+            .is_some_and(|v| v.pos == drawn.pos && v.yaw == drawn.yaw && v.pitch == drawn.pitch);
+        self.seen_view = Some(view);
+        if followed { view } else { drawn }
+    }
+
     /// The labels of this dimension's visible waypoints, far ones first so
     /// near ones draw over them.
     /// Distances are from the player's feet (`player`), as the list shows them.
+    /// Labels land on whole screen pixels, `step` GUI pixels apart.
     pub fn labels(
         &self,
         camera: Camera,
         player: [f64; 3],
         dimension: &str,
         size: [f32; 2],
+        step: f32,
         measure: &dyn Fn(&str) -> f32,
     ) -> Vec<Draw> {
         if !self.labels.unwrap_or(true) {
@@ -945,13 +963,15 @@ impl State {
             })
             .collect();
         shown.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let snap = |v: f32| (v / step).round() * step;
         let mut draws = Vec::new();
         for (d, [x, y], w) in shown {
+            let (x, y) = (snap(x), snap(y));
             let dist = distance_text(d);
             let (name_w, dist_w) = (measure(&w.name), measure(&dist));
             let width = name_w + 6.0 + dist_w;
-            let left = (x - width / 2.0).round();
-            let top = (y - 16.0).round();
+            let left = snap(x - width / 2.0);
+            let top = y - 16.0;
             draws.push(Draw::Fill([left - 3.0, top - 2.0, width + 6.0, 12.0], LABEL_BG));
             draws.push(Draw::Text(w.name.clone(), [left, top], w.color, true));
             draws.push(Draw::Text(dist, [left + name_w + 6.0, top], INK, true));
@@ -1357,7 +1377,7 @@ mod tests {
             death: false,
         };
         s.waypoints = vec![mk("A", OVERWORLD, false), mk("B", OVERWORLD, true), mk("C", NETHER, false)];
-        let draws = s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], &measure);
+        let draws = s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], 1.0, &measure);
         let texts: Vec<&str> = draws
             .iter()
             .filter_map(|d| match d {
@@ -1367,7 +1387,7 @@ mod tests {
             .collect();
         assert_eq!(texts, ["A", "20 m"]);
         s.labels = Some(false);
-        assert!(s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], &measure).is_empty());
+        assert!(s.labels(camera, [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], 1.0, &measure).is_empty());
     }
 
     fn spot(x: i32) -> Spot {
@@ -1493,5 +1513,53 @@ mod tests {
         assert!(read_on(None));
         assert!(!read_on(Some("false".into())));
         assert_eq!(deaths_label(false), "Waypoint on death: OFF");
+    }
+
+    fn camera(yaw: f32) -> Camera {
+        Camera {
+            pos: [0.5, 65.62, 0.5],
+            yaw,
+            pitch: 0.0,
+            fov: 70.0,
+        }
+    }
+
+    #[test]
+    fn labels_follow_this_frames_view() {
+        let mut s = State::default();
+        // Nothing to compare with yet: what the world was drawn from.
+        assert_eq!(s.label_camera(camera(0.0), camera(10.0)), camera(0.0));
+        // The last view is what was drawn: the game's view is the camera.
+        assert_eq!(s.label_camera(camera(10.0), camera(25.0)), camera(25.0));
+    }
+
+    #[test]
+    fn labels_stay_with_a_mods_camera() {
+        let mut s = State::default();
+        s.label_camera(camera(0.0), camera(0.0));
+        // A freecam drew from 90 while the player's own view stays at 0.
+        assert_eq!(s.label_camera(camera(90.0), camera(0.0)), camera(90.0));
+        assert_eq!(s.label_camera(camera(95.0), camera(0.0)), camera(95.0));
+    }
+
+    #[test]
+    fn labels_land_on_whole_screen_pixels() {
+        let mut s = State::default();
+        s.waypoints = vec![Waypoint {
+            name: "A".into(),
+            pos: [3, 65, 20],
+            dimension: OVERWORLD.into(),
+            color: 0x55FFFF,
+            hidden: false,
+            death: false,
+        }];
+        let draws = s.labels(camera(0.0), [0.5, 64.0, 0.5], OVERWORLD, [480.0, 270.0], 0.5, &measure);
+        for draw in &draws {
+            let [x, y] = match draw {
+                Draw::Fill(rect, _) => [rect[0], rect[1]],
+                Draw::Text(_, at, ..) => *at,
+            };
+            assert_eq!([(x * 2.0).fract(), (y * 2.0).fract()], [0.0, 0.0], "{draw:?}");
+        }
     }
 }

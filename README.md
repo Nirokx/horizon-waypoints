@@ -19,7 +19,7 @@ Uses the Horizon launcher's own Rust and Horizon source (nothing else to install
 L=~/.local/share/horizon-launcher
 export PATH=$L/rust/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH CARGO_HOME=$L/cargo
 cargo test --offline                      # the mod's logic
-python3 tools/package.py --install        # target/waypoints-1.1.0.hnmod, copied into the launcher's native mods
+python3 tools/package.py --install        # target/waypoints-1.1.1.hnmod, copied into the launcher's native mods
 ```
 
 Then build the game with its mods in the launcher. The mod is pinned to Horizon

@@ -1,6 +1,6 @@
 [mod]
 id = "waypoints"
-version = "1.1.0"
+version = "1.1.1"
 priority = 100
 
 # Pinned: besides the native hook points it reads the window's world folder
