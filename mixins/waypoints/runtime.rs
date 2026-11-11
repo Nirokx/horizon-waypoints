@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// The mod's id (its data folder and its keys' lines), name and version.
 pub const ID: &str = "waypoints";
 pub const NAME: &str = "Waypoints";
-pub const VERSION: &str = "1.1.1";
+pub const VERSION: &str = "1.1.2";
 pub const DESCRIPTION: &str = "N creates a waypoint, M lists them: hide, edit, recolour or delete them. Visible waypoints show their name and distance in the world, and dying can leave one where you died.";
 /// The keys' names and defaults (`key.waypoints.create` in `horizon-mods.txt`).
 pub const KEY_CREATE: &str = "create";
@@ -268,6 +268,29 @@ thread_local! {
 /// game inside, so it is never borrowed twice.
 pub fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.with(|s| f(&mut s.borrow_mut()))
+}
+
+/// `Waypoints 1.1.2`, as Options > Mods lists it.
+pub fn title() -> String {
+    format!("{NAME} {VERSION}")
+}
+
+/// The keys Options > Mods lists: name, label and default key.
+pub fn keys() -> Vec<[String; 3]> {
+    vec![
+        [KEY_CREATE.into(), "Create waypoint".into(), DEFAULT_CREATE.into()],
+        [KEY_LIST.into(), "Waypoint list".into(), DEFAULT_LIST.into()],
+    ]
+}
+
+/// The waypoints of a server, by its address as typed.
+pub fn server_key(address: &str) -> String {
+    format!("server-{}", address.trim().to_lowercase())
+}
+
+/// The waypoints of a single player world, by its save folder.
+pub fn world_key(folder: &str) -> String {
+    format!("world-{folder}")
 }
 
 /// The letter a key name types (`key.keyboard.n` types `n`), if it is one.
@@ -1245,6 +1268,14 @@ mod tests {
         ];
         assert_eq!(decode(&encode(&list)), list);
         assert!(decode("garbage\n1\t2").is_empty());
+    }
+
+    #[test]
+    fn keys_name_servers_and_worlds() {
+        assert_eq!(server_key(" Play.Example.net:25565 "), "server-play.example.net:25565");
+        assert_eq!(world_key("New World"), "world-New World");
+        assert_eq!(title(), format!("Waypoints {VERSION}"));
+        assert_eq!(keys()[0][2], DEFAULT_CREATE);
     }
 
     #[test]

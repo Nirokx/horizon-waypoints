@@ -6,7 +6,7 @@ fn waypoints_frame(game: &mut crate::game::Game<'_>) {
     let key = if game.native_player().is_none() {
         None
     } else if let (None, Some(remote)) = (&game.integrated, &game.remote) {
-        Some(format!("server-{}", remote.session.address.trim().to_lowercase()))
+        Some(m::server_key(&remote.session.address))
     } else if let Some(folder) = game
         .world_icon
         .as_ref()
@@ -14,11 +14,11 @@ fn waypoints_frame(game: &mut crate::game::Game<'_>) {
     {
         // The single player world's save folder: the window keeps it for the
         // world's icon from the moment its server starts.
-        Some(format!("world-{}", folder.to_string_lossy()))
+        Some(m::world_key(&folder.to_string_lossy()))
     } else {
         // The icon is taken and forgotten: the world stays the one loaded.
         let current = m::with(|s| s.world.clone()).filter(|w| w.starts_with("world-"));
-        let named = game.integrated.as_ref().map(|i| format!("world-{}", i.world_name));
+        let named = game.integrated.as_ref().map(|i| m::world_key(&i.world_name));
         current.or(named).or_else(|| Some("world".into()))
     };
     let dir = game.native_data_dir(m::ID);

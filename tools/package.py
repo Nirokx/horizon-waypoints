@@ -17,9 +17,24 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLED = Path.home() / '.local/share/horizon/horizon-native-mods'
 
 
+def hookable(bundle):
+    """Horizon's `hook_points_stay_hookable` test: the hook adapters are copied into
+    `native_hooks.rs`, where a macro or a `cfg` fails Horizon's tests. Only the runtime
+    module may use them."""
+    for path in sorted(bundle.glob('*.rs')):
+        if path.name == 'runtime.rs':
+            continue
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if line.lstrip().startswith('//'):
+                continue
+            if 'cfg' in line or any(mac in line for mac in ('!(', '![', '! {', '!{')):
+                raise SystemExit(f'{path.name}:{number}: no macros or cfg in a hook adapter: {line.strip()}')
+
+
 def package():
     compat = json.loads((ROOT / 'compatibility.json').read_text())
     bundle = ROOT / 'mixins' / 'waypoints'
+    hookable(bundle)
     mixin = tomllib.loads((bundle / 'horizon-mixin.toml').read_text())
     mod = mixin['mod']
     if mixin.get('compatibility', {}).get('horizon_revision') != compat['horizon_revision']:
